@@ -269,3 +269,153 @@ Re-running Q4 against the narrow table:
 
 **What I did:** normalized the wide table (kept only the columns the queries need). Buffer reads
 dropped ~7× (9,239 → 1,287).
+
+### 4.5 Composite index (removes the Sort step)
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT order_id, status, order_date FROM orders
+WHERE customer_id = 100 AND status = 'paid' ORDER BY order_date DESC;
+```
+
+<img width="2372" height="1072" alt="image" src="https://github.com/user-attachments/assets/37f16330-b3e3-484d-b206-cc68ceba0608" />
+
+```sql
+CREATE INDEX idx_orders_cust_status_date ON orders(customer_id, status, order_date DESC);
+ANALYZE orders;
+```
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT order_id, status, order_date FROM orders
+WHERE customer_id = 100 AND status = 'paid' ORDER BY order_date DESC;
+```
+
+<img width="2352" height="494" alt="image" src="https://github.com/user-attachments/assets/fd0fc190-593e-4b32-a347-523fea2f54ef" />
+
+| | Before | After |
+|---|---|---|
+| Plan | Bitmap Index Scan **+ separate Sort node** | `Index Scan` on the composite index, **no Sort** |
+| Time | 0.369 ms | 0.339 ms |
+
+**What I did:** created `(customer_id, status, order_date DESC)`. The `Sort` node disappeared because the index already returns rows in the required order. Column order matters: the filter columns come first and the sort column last.
+
+### 4.6 Partial index
+```sql
+CREATE INDEX idx_orders_paid_partial ON orders(order_date) WHERE status = 'paid';
+ANALYZE orders;
+```
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT order_id, order_date, total_amount FROM orders
+WHERE status = 'paid' AND order_date >= NOW() - INTERVAL '30 days';
+```
+
+<img width="2376" height="710" alt="image" src="https://github.com/user-attachments/assets/f4357872-73dd-4921-9126-a8791689b8b8" />
+
+The query used `Bitmap Index Scan on idx_orders_paid_partial` and finished in **1.814 ms**. A partial index only stores the `paid` rows, so it is smaller and useful when most queries care about one status.
+
+### 4.7 Q5 — note
+Q5 aggregates **every** order item (no `WHERE`), so it must read the whole `order_items` table. A full Sequential Scan is the correct plan here; an index cannot help a full-table aggregation. The slowness is inherent to the query, not a missing index.
+
+## 5. Task 2 — Locking and blocking
+While the load script was running I detected blocked sessions with `pg_blocking_pids`:
+
+```sql
+SELECT blocked.pid AS blocked_pid, blocked.query AS blocked_query, blocking.pid AS blocking_pid, blocking.query AS blocking_query, blocked.wait_event_type, blocked.wait_event
+FROM pg_stat_activity blocked
+JOIN pg_stat_activity blocking ON blocking.pid = ANY(pg_blocking_pids(blocked.pid))
+ORDER BY blocked.pid;
+```
+
+<img width="2918" height="114" alt="image" src="https://github.com/user-attachments/assets/6694136a-d4d6-44e4-b9b7-f4a7b5a04d7e" />
+<img width="2916" height="112" alt="image" src="https://github.com/user-attachments/assets/40273e55-f693-4289-8fa8-98e9eeb7df21" />
+<img width="2916" height="112" alt="image" src="https://github.com/user-attachments/assets/7db52747-27c3-4a20-887c-2616a49bfcfc" />
+
+**Result:** several sessions were blocked, all waiting on the same blocking query `LOCK TABLE orders IN SHARE ROW EXCLUSIVE MODE`, with `wait_event_type = Lock` and `wait_event = relation`. This is a **table-level lock**: the `table_lock_worker` holds an explicit lock on `orders`, so other writers to `orders` have to wait. I also saw row-level lock waits (`wait_event = transactionid`) on `UPDATE` statements from the conflicting-update workers.
+ 
+MVCC lets readers and writers work together, but two writers on the same resource (a row, or a whole table) must wait.
+
+## 6. Task 6 / maintenance — VACUUM and dead tuples
+The `update_worker` keeps updating `customer_events_wide`. In PostgreSQL an `UPDATE` writes a new row version and marks the old one as a **dead tuple** (MVCC), which bloats a wide table.
+
+```sql
+SELECT relname, n_live_tup, n_dead_tup, pg_size_pretty(pg_table_size(relid)) AS size
+FROM pg_stat_user_tables WHERE relname = 'customer_events_wide';
+```
+<img width="1566" height="112" alt="image" src="https://github.com/user-attachments/assets/9142444f-01be-470c-bf41-5f0afba87435" />
+
+```sql
+UPDATE customer_events_wide
+SET attr_01 = 'updated_'||now()::text, attr_02='changed', attr_03='changed', attr_04='changed'
+WHERE customer_id BETWEEN 1 AND 10000;
+```
+
+```sql
+SELECT relname, n_live_tup, n_dead_tup, pg_size_pretty(pg_table_size(relid)) AS size
+FROM pg_stat_user_tables WHERE relname = 'customer_events_wide';
+```
+
+<img width="1566" height="126" alt="image" src="https://github.com/user-attachments/assets/c0f900ee-5c0d-441e-87b4-155263ac5252" />
+
+```sql
+VACUUM ANALYZE customer_events_wide;
+```
+
+```sql
+SELECT relname, n_live_tup, n_dead_tup, pg_size_pretty(pg_table_size(relid)) AS size
+FROM pg_stat_user_tables WHERE relname = 'customer_events_wide';
+```
+
+<img width="1554" height="116" alt="image" src="https://github.com/user-attachments/assets/882bcc5d-7bcd-4f39-a706-ce401621ac34" />
+
+| Stage | Size | Dead tuples |
+|---|---:|---:|
+| Before update | 73 MB | 11,493 |
+| After update | **103 MB** | 11,493* |
+| After `VACUUM ANALYZE` | 103 MB | **376** |
+
+the dead-tuple counter is refreshed by the stats collector with a delay, and the load script's autovacuum is running in parallel, so the number fluctuates; the clear evidence of bloat is the **size growth 73 MB → 103 MB** after the updates.
+ 
+**Observations:** `VACUUM` removed the dead tuples (down to 376) and refreshed statistics, but it does **not** return the disk space to the OS — the file stays 103 MB. Only `VACUUM FULL` rewrites and shrinks the file, but it needs an `ACCESS EXCLUSIVE` lock so it cannot run while the table is in use. The narrow `customer_events_core` table also helps here, because small rows produce far less bloat per update.
+
+## 7. All indexes created
+```sql
+SELECT indexname, tablename, indexdef
+FROM pg_indexes WHERE schemaname='public' AND indexname LIKE 'idx_%'
+ORDER BY tablename, indexname;
+```
+
+<img width="3004" height="668" alt="image" src="https://github.com/user-attachments/assets/60f744e5-c0ca-4682-899b-6fa9db3d87dc" />
+
+| index | table | purpose |
+|---|---|---|
+| idx_core_event_time | customer_events_core | filter on date (narrow table) |
+| idx_core_customer_id | customer_events_core | join key (narrow table) |
+| idx_events_event_time | customer_events_wide | filter on date (used only when selective) |
+| idx_customers_email_trgm | customers | GIN trigram for `LIKE '%...%'` |
+| idx_orders_status | orders | filter on status (Q2) |
+| idx_orders_cust_status_date | orders | composite filter + sort |
+| idx_orders_paid_partial | orders | partial index for `status='paid'` |
+
+(plus the script's original `idx_orders_customer_id`, `idx_order_items_order_id`, `idx_order_items_product_id`, `idx_events_customer_id`.)
+
+## 8. Before / after summary
+| Query / object | Before | After | Result |
+|---|---|---|---|
+| Q1 email substring | Seq Scan, 5.910 ms, 657 buf | GIN Bitmap Index Scan, 0.081 ms, 7 buf | ~70× faster (selective filter) |
+| Q2 orders status | Seq Scan, 18.973 ms | Bitmap Index Scan, 8.290 ms | ~2.3× faster |
+| Q4 events aggregation | Seq Scan wide, 174.467 ms, 9,239 buf | Narrow table, 147.262 ms, 1,287 buf | buffers −7× |
+| Q4 event_time index | Seq Scan | Seq Scan (index ignored) | proves selectivity rule |
+| Composite query | Index Scan + Sort, 0.369 ms | Index Scan, no Sort, 0.339 ms | Sort eliminated |
+| Wide table | 73 MB | 103 MB after updates → dead tuples 376 after VACUUM | bloat shown + cleaned |
+| Wide vs narrow | 73 MB | 11 MB | ~7× smaller |
+
+## 9. Conclusions
+The biggest gains:
+ 
+1. **Fixing the wide table.** `customer_events_wide` was the worst object - biggest per row, slowest to scan (9,239 buffers for 3 columns) and the source of update bloat. Splitting the hot columns into a narrow `customer_events_core` cut buffer reads ~7× and the table size from 73 MB to 11 MB.
+2. **Adding indexes only where the filter is selective.** `orders(status)`, the GIN trigram index, the composite `(customer_id, status, order_date DESC)` and the partial index all helped real, selective queries. The experiment also showed the opposite: when a filter matches ~50% of the table (Q4, `180 days`), PostgreSQL correctly **ignores** the index and keeps a Sequential Scan, so adding it there would just waste disk and slow down writes.
+ 
+Tools used: `EXPLAIN (ANALYZE, BUFFERS)`, `pg_stat_activity`, `pg_locks`, `pg_blocking_pids`,
+`pg_stat_user_tables`, `VACUUM` / `ANALYZE`.
